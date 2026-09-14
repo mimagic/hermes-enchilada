@@ -1,0 +1,8 @@
+name: enchilada
+version: 0.1.0
+description: "Enchilada — graph-based knowledge memory (getenchilada.com). Documents, entities and relations queried over REST."
+pip_dependencies: []
+requires_env:
+  - ENCHILADA_API_KEY
+hooks:
+  - on_session_end
