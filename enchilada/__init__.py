@@ -11,12 +11,17 @@ This provider wires it into Hermes as a memory backend:
   curated knowledge base, not a chat log: every document costs LLM extraction
   work and pollutes the graph if it is conversational noise. The model writes
   when the user asks, via ``enchilada_remember``.
-* **Reflection (opt-in)** — with ``ENCHILADA_REFLECT`` set, the provider
-  periodically distils *durable facts* from the conversation with an auxiliary
-  model and **proposes** them: the suggestion rides the next turn's memory block
-  as a question. Nothing is written until the user agrees and the model calls
-  ``enchilada_remember``. This is the Honcho-style "learn from talking"
-  behaviour, minus both the transcript dumping and the silent writes.
+* **Reflection** — the provider distils *durable facts* from conversations with
+  an auxiliary model. Two modes (``ENCHILADA_REFLECT``):
+
+  ``auto``  learn continuously: facts are stored immediately, flagged
+            ``unreviewed`` so everything learned without explicit approval stays
+            visible and prunable in the portal. The user is told what was kept.
+  ``ask``   propose only: the suggestion rides the next memory block and nothing
+            is written until the user agrees.
+
+  Either way the extraction is conservative — session events, task progress and
+  low-confidence guesses are dropped, and most conversations yield nothing.
 
 Config (env, all optional except the key):
   ENCHILADA_API_KEY    required, ``ench_*``
@@ -25,7 +30,7 @@ Config (env, all optional except the key):
   ENCHILADA_TIMEOUT    per-call seconds, default 8 (must stay <= the core's 8s cap)
   ENCHILADA_TOP_K      recall hits per turn, default 5
   ENCHILADA_RECALL     ``off`` disables automatic recall (tools still work)
-  ENCHILADA_REFLECT    ``on`` enables fact proposals (default off)
+  ENCHILADA_REFLECT    ``auto`` | ``ask`` | ``off`` (default off)
   ENCHILADA_REFLECT_EVERY  turns between reflection passes, default 6
 """
 
@@ -71,11 +76,31 @@ _PROPOSAL_HEADER = (
     "decline or ignore it, drop the subject and do not ask again."
 )
 
+# Autonomous mode still tells the user — silent background writes to their own
+# knowledge base are the kind of thing people discover months later and resent.
+_LEARNED_HEADER = (
+    "REFLECTION — learned and stored from this conversation, flagged unreviewed. "
+    "Mention this briefly and naturally if there is a good moment; do not derail "
+    "the conversation for it. If the user objects, call enchilada_forget_learned "
+    "to remove them and stop learning for this session."
+)
+
 
 def _truthy(value: Optional[str], default: bool = True) -> bool:
     if value is None or value == "":
         return default
     return value.strip().lower() not in ("0", "false", "off", "no")
+
+
+def _reflect_mode(value: Optional[str]) -> str:
+    """``auto`` learns autonomously, ``ask`` proposes, anything else is off.
+    Bare truthy values map to ``ask`` — the safer reading of an ambiguous ``on``."""
+    normalized = (value or "").strip().lower()
+    if normalized in ("auto", "always", "autonomous"):
+        return "auto"
+    if normalized in ("ask", "propose", "suggest"):
+        return "ask"
+    return "ask" if normalized in ("1", "true", "on", "yes") else "off"
 
 
 class EnchiladaMemoryProvider(MemoryProvider):
@@ -96,13 +121,14 @@ class EnchiladaMemoryProvider(MemoryProvider):
         self._recall_enabled = True
         self._top_k = 5
         # Reflection state: proposals wait here until a turn picks them up.
-        self._reflect_enabled = False
+        self._reflect_mode = "off"           # off | ask | auto
         self._reflect_every = 6
         self._reflect_turn = 0
         self._reflect_running = False
         self._proposal: str = ""
-        self._proposed_titles: set = set()   # never propose the same fact twice
+        self._proposed_titles: set = set()   # never propose/store the same fact twice
         self._declined = False               # one refusal silences reflection for the session
+        self._learned_ids: List[str] = []    # documents written autonomously this session
 
     # -- availability ------------------------------------------------------
 
@@ -124,7 +150,7 @@ class EnchiladaMemoryProvider(MemoryProvider):
         except ValueError:
             self._top_k = 5
         self._recall_enabled = _truthy(os.environ.get("ENCHILADA_RECALL"), True)
-        self._reflect_enabled = _truthy(os.environ.get("ENCHILADA_REFLECT"), False)
+        self._reflect_mode = _reflect_mode(os.environ.get("ENCHILADA_REFLECT"))
         try:
             self._reflect_every = max(2, int(os.environ.get("ENCHILADA_REFLECT_EVERY", "") or 6))
         except ValueError:
@@ -140,15 +166,23 @@ class EnchiladaMemoryProvider(MemoryProvider):
         # disable anything — recall is just as useful for a subagent.
 
     def system_prompt_block(self) -> str:
-        if not self._recall_enabled:
+        if not self._recall_enabled and self._reflect_mode == "off":
             return ""
-        return (
+        block = (
             "Enchilada knowledge base: relevant documents are recalled automatically "
             "and appear under <enchilada-memory>. Cite them when you use them. "
             "Use enchilada_search for a targeted lookup, enchilada_ask for a "
             "graph-reasoned answer across documents, and enchilada_remember ONLY "
             "when the user explicitly asks to store something."
         )
+        if self._reflect_mode == "auto":
+            block += (
+                " Reflection also learns durable facts from conversations on its own "
+                "and stores them flagged unreviewed; a REFLECTION note lists what was "
+                "kept. Do not repeat that list verbatim — mention it naturally when it "
+                "fits, and use enchilada_forget_learned if the user objects."
+            )
+        return block
 
     # -- recall ------------------------------------------------------------
 
@@ -275,10 +309,10 @@ class EnchiladaMemoryProvider(MemoryProvider):
     def sync_turn(self, user_content: str, assistant_content: str, *,
                   session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None,
                   turn_author: Optional[Dict[str, Any]] = None) -> None:
-        """Nothing is written here — a completed turn only advances the reflection
-        clock. Runs on the manager's background worker, so the LLM pass is free to
-        take its time."""
-        if not (self._reflect_enabled and self._client) or self._declined:
+        """Raw turns are never written. This only advances the reflection clock and,
+        when due, runs the extraction pass. Runs on the manager's background worker,
+        so the LLM call and any writes are free to take their time."""
+        if self._reflect_mode == "off" or not self._client or self._declined:
             return
         self._reflect_turn += 1
         if self._reflect_turn % self._reflect_every:
@@ -302,12 +336,41 @@ class EnchiladaMemoryProvider(MemoryProvider):
             return
         for fact in fresh:
             self._proposed_titles.add(fact["title"].lower())
-        body = "\n".join(f"- {f['title']}: {f['text']}" for f in fresh)
-        with self._lock:
-            self._proposal = f"{_PROPOSAL_HEADER}\n\n{body}"
+
+        if self._reflect_mode == "ask":
+            body = "\n".join(f"- {f['title']}: {f['text']}" for f in fresh)
+            with self._lock:
+                self._proposal = f"{_PROPOSAL_HEADER}\n\n{body}"
+            return
+
+        stored = self._store_learned(fresh)
+        if stored:
+            body = "\n".join(f"- {title}" for title in stored)
+            with self._lock:
+                self._proposal = f"{_LEARNED_HEADER}\n\n{body}"
+
+    def _store_learned(self, facts: List[Dict[str, str]]) -> List[str]:
+        """Write autonomously-learned facts, flagged ``unreviewed`` so they are
+        auditable and prunable rather than indistinguishable from curated material."""
+        stored: List[str] = []
+        for fact in facts:
+            try:
+                result = self._client.insert_text(
+                    fact["text"], fact["title"],
+                    review_status="unreviewed",
+                    metadata={"source": "hermes-reflection", "session": self._session_id},
+                )
+            except EnchiladaError as exc:
+                logger.debug("Storing learned fact failed: %s", exc)
+                continue
+            document_id = str(result.get("rag_doc_id") or result.get("id") or "")
+            if document_id:
+                self._learned_ids.append(document_id)
+            stored.append(fact["title"])
+        return stored
 
     def decline_reflection(self) -> None:
-        """Stop proposing for this session (the user said no)."""
+        """Stop learning for this session (the user said no)."""
         self._declined = True
         with self._lock:
             self._proposal = ""
@@ -358,6 +421,13 @@ class EnchiladaMemoryProvider(MemoryProvider):
                     "required": ["text"],
                 },
             },
+            {
+                "name": "enchilada_forget_learned",
+                "description": ("Delete the facts this session learned autonomously and "
+                                "stop learning for the rest of it. Call when the user "
+                                "objects to something reflection stored."),
+                "parameters": {"type": "object", "properties": {}},
+            },
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -379,6 +449,14 @@ class EnchiladaMemoryProvider(MemoryProvider):
                 result = self._client.insert_text(text, str(args.get("title", "")).strip())
                 return json.dumps({"stored": True, "document": result},
                                   ensure_ascii=False, default=str)[:4000]
+            if tool_name == "enchilada_forget_learned":
+                removed = [doc_id for doc_id in list(self._learned_ids)
+                           if self._client.delete_document(doc_id)]
+                self._learned_ids.clear()
+                self.decline_reflection()
+                return json.dumps({"removed": len(removed),
+                                   "learning_disabled_for_session": True},
+                                  ensure_ascii=False)
         except EnchiladaError as exc:
             payload: Dict[str, Any] = {"error": str(exc), "status": exc.status}
             if exc.needs_llm_key:
@@ -403,6 +481,7 @@ class EnchiladaMemoryProvider(MemoryProvider):
             self._declined = False
             self._proposed_titles.clear()
             self._reflect_turn = 0
+            self._learned_ids.clear()
 
     def shutdown(self) -> None:
         with self._lock:
@@ -427,8 +506,10 @@ class EnchiladaMemoryProvider(MemoryProvider):
             {"key": "recall", "description": "Automatic recall before each turn",
              "type": "boolean", "default": True, "env_var": "ENCHILADA_RECALL"},
             {"key": "reflect", "description":
-             "Propose durable facts from conversations (asks before storing)",
-             "type": "boolean", "default": False, "env_var": "ENCHILADA_REFLECT"},
+             "Learn durable facts from conversations: auto (store, flagged "
+             "unreviewed) | ask (propose first) | off",
+             "default": "off", "choices": ["off", "auto", "ask"],
+             "env_var": "ENCHILADA_REFLECT"},
             {"key": "reflect_every", "description": "Turns between reflection passes",
              "type": "integer", "default": 6, "minimum": 2, "maximum": 50,
              "env_var": "ENCHILADA_REFLECT_EVERY"},

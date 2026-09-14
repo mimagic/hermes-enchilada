@@ -29,7 +29,7 @@ Secrets belong in `~/.hermes/.env` (chmod 600), never in `config.yaml`:
 | `ENCHILADA_TIMEOUT` | no | `8` | Per-call seconds |
 | `ENCHILADA_TOP_K` | no | `5` | Documents recalled per turn |
 | `ENCHILADA_RECALL` | no | `on` | `off` disables automatic recall (tools stay) |
-| `ENCHILADA_REFLECT` | no | `off` | `on` proposes durable facts from conversations |
+| `ENCHILADA_REFLECT` | no | `off` | `auto` learns continuously, `ask` proposes first |
 | `ENCHILADA_REFLECT_EVERY` | no | `6` | Turns between reflection passes |
 
 **The workspace header wants the UUID, not the `ragWorkspace` slug.** Passing the
@@ -82,15 +82,26 @@ when the user asks.
 
 ### Reflection — learning from conversations (opt-in, off by default)
 
-`ENCHILADA_REFLECT=on` makes the provider *notice* durable facts instead of
-waiting to be told. Every `ENCHILADA_REFLECT_EVERY` turns (default 6), an
-auxiliary-model pass reads the conversation and extracts only what stays true
-afterwards — preferences, decisions and their reasons, domain facts, corrections.
+Reflection makes the provider *notice* durable facts instead of waiting to be
+told. Every `ENCHILADA_REFLECT_EVERY` turns (default 6), an auxiliary-model pass
+reads the conversation and extracts only what stays true afterwards —
+preferences, decisions and their reasons, domain facts, corrections.
 
-**It proposes; it never stores.** The result rides the next memory block as a
-request to ask the user, and nothing is written until they agree and the model
-calls `enchilada_remember`. A refusal silences reflection for the session; the
-same fact is never proposed twice; a genuinely new conversation resets both.
+| `ENCHILADA_REFLECT` | Behaviour |
+| :--- | :--- |
+| `auto` | Stores immediately, flagged `review_status: unreviewed`, and reports what it kept. Continuous learning as a system property. |
+| `ask` | Proposes in the next memory block; nothing is written until the user agrees. |
+| `off` | Default. Only explicit `enchilada_remember` writes. |
+
+**`auto` is not silent.** Every pass reports what it stored, and
+`enchilada_forget_learned` deletes this session's autonomous writes and stops
+learning for the rest of it. The `unreviewed` flag keeps machine-learned material
+distinguishable from curated documents — auditable and prunable in the portal.
+That flag is what makes autonomous writing acceptable rather than a booby trap
+discovered months later.
+
+A refusal silences reflection for the session; the same fact is never stored
+twice; a genuinely new conversation resets both.
 
 What it keeps versus drops, from a real run:
 

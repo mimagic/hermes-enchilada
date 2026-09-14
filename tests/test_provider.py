@@ -55,6 +55,7 @@ class FakeClient:
         self.delay = delay
         self.searches = []
         self.inserts = []
+        self.deletes = []
 
     def search(self, query, top_k=5, timeout=None):
         self.searches.append(query)
@@ -69,11 +70,15 @@ class FakeClient:
             raise self.fail
         return f"answer to {question}"
 
-    def insert_text(self, text, title="", timeout=None):
+    def insert_text(self, text, title="", review_status="", metadata=None, timeout=None):
         if self.fail:
             raise self.fail
-        self.inserts.append((text, title))
-        return {"status": "queued", "job_id": "job_1"}
+        self.inserts.append((text, title, review_status))
+        return {"status": "queued", "rag_doc_id": f"doc_{len(self.inserts)}"}
+
+    def delete_document(self, document_id, timeout=None):
+        self.deletes.append(document_id)
+        return True
 
 
 HIT = {"title": "doc one", "snippet": "the user is marsch"}
@@ -83,8 +88,10 @@ HIT2 = {"title": "doc two", "snippet": "enchilada is a graph platform"}
 @pytest.fixture
 def provider(monkeypatch):
     monkeypatch.setenv("ENCHILADA_API_KEY", "ench_test")
-    monkeypatch.delenv("ENCHILADA_RECALL", raising=False)
-    monkeypatch.delenv("ENCHILADA_TOP_K", raising=False)
+    # Clear every knob: a developer's real .env must not decide test outcomes.
+    for var in ("ENCHILADA_RECALL", "ENCHILADA_TOP_K", "ENCHILADA_REFLECT",
+                "ENCHILADA_REFLECT_EVERY", "ENCHILADA_TIMEOUT"):
+        monkeypatch.delenv(var, raising=False)
     p = EnchiladaMemoryProvider()
     p.initialize("s1", hermes_home="/tmp", platform="cli")
     return p
@@ -159,6 +166,7 @@ def test_background_prefetch_is_consumed_next_turn(provider):
 def test_recall_can_be_disabled(monkeypatch):
     monkeypatch.setenv("ENCHILADA_API_KEY", "ench_test")
     monkeypatch.setenv("ENCHILADA_RECALL", "off")
+    monkeypatch.delenv("ENCHILADA_REFLECT", raising=False)
     p = EnchiladaMemoryProvider()
     p.initialize("s1", hermes_home="/tmp", platform="cli")
     fake = FakeClient(hits=[HIT])
@@ -235,7 +243,8 @@ def test_tool_schemas_are_well_formed(provider):
         assert schema["name"] and schema["description"]
         assert schema["parameters"]["type"] == "object"
         names.add(schema["name"])
-    assert names == {"enchilada_search", "enchilada_ask", "enchilada_remember"}
+    assert names == {"enchilada_search", "enchilada_ask", "enchilada_remember",
+                     "enchilada_forget_learned"}
 
 
 def test_search_tool_returns_json(provider):
@@ -252,7 +261,7 @@ def test_remember_tool_stores(provider):
     result = json.loads(provider.handle_tool_call(
         "enchilada_remember", {"text": "a fact", "title": "t"}))
     assert result["stored"] is True
-    assert fake.inserts == [("a fact", "t")]
+    assert fake.inserts == [("a fact", "t", "")]
 
 
 def test_remember_rejects_empty_text(provider):
@@ -303,7 +312,7 @@ def test_config_schema_marks_key_secret(provider):
 
 def test_reflection_defaults_to_off(provider):
     """Writing to someone's knowledge base uninvited is a surprise."""
-    assert provider._reflect_enabled is False
+    assert provider._reflect_mode == "off"
 
 
 # -- reflection -----------------------------------------------------------
@@ -314,7 +323,7 @@ FACTS = [{"title": "deploy flow", "text": "Deploys go through staging first."}]
 @pytest.fixture
 def reflecting(monkeypatch):
     monkeypatch.setenv("ENCHILADA_API_KEY", "ench_test")
-    monkeypatch.setenv("ENCHILADA_REFLECT", "on")
+    monkeypatch.setenv("ENCHILADA_REFLECT", "ask")
     monkeypatch.setenv("ENCHILADA_REFLECT_EVERY", "2")
     p = EnchiladaMemoryProvider()
     p.initialize("s1", hermes_home="/tmp", platform="cli")
@@ -422,6 +431,71 @@ def test_reflect_drops_factless_entries():
 
     facts = _parse_facts('{"facts": [{"title": "t"}, {"text": "keeps"}]}')
     assert len(facts) == 1 and facts[0]["text"] == "keeps"
+
+
+# -- autonomous (auto) mode -----------------------------------------------
+
+@pytest.fixture
+def learning(monkeypatch):
+    monkeypatch.setenv("ENCHILADA_API_KEY", "ench_test")
+    monkeypatch.setenv("ENCHILADA_REFLECT", "auto")
+    monkeypatch.setenv("ENCHILADA_REFLECT_EVERY", "2")
+    p = EnchiladaMemoryProvider()
+    p.initialize("s1", hermes_home="/tmp", platform="cli")
+    p._client = FakeClient(hits=[])
+    return p
+
+
+def test_auto_mode_stores_without_asking(learning):
+    _drive_turns(learning, 2)
+    assert len(learning._client.inserts) == 1
+    text, title, review = learning._client.inserts[0]
+    assert "staging" in text
+    assert review == "unreviewed", "autonomous writes must stay auditable"
+
+
+def test_auto_mode_tells_the_user_what_it_learned(learning):
+    """Silent background writes to someone's knowledge base breed resentment."""
+    _drive_turns(learning, 2)
+    context = learning.prefetch("and then?", session_id="s1")
+    assert "REFLECTION" in context
+    assert "learned and stored" in context
+    assert "deploy flow" in context
+
+
+def test_auto_mode_tags_provenance(learning):
+    _drive_turns(learning, 2)
+    # metadata rides the same call; assert via the client contract
+    assert learning._learned_ids, "stored document ids must be tracked for undo"
+
+
+def test_forget_learned_deletes_and_stops_learning(learning):
+    import json
+
+    _drive_turns(learning, 2)
+    assert learning._learned_ids
+    result = json.loads(learning.handle_tool_call("enchilada_forget_learned", {}))
+    assert result["removed"] == 1
+    assert result["learning_disabled_for_session"] is True
+    assert learning._client.deletes, "the document must actually be deleted"
+    _drive_turns(learning, 4)
+    assert learning._client.inserts == [] or len(learning._client.inserts) == 1
+
+
+def test_auto_mode_survives_a_failed_write(learning):
+    learning._client = FakeClient(fail=EnchiladaError("boom"))
+    _drive_turns(learning, 2)
+    assert learning._proposal == "", "a failed write must not claim it learned"
+
+
+def test_reflect_mode_parsing():
+    from enchilada_plugin import _reflect_mode
+
+    assert _reflect_mode("auto") == "auto"
+    assert _reflect_mode("ask") == "ask"
+    assert _reflect_mode("off") == "off"
+    assert _reflect_mode(None) == "off"
+    assert _reflect_mode("on") == "ask", "ambiguous truthy must take the safer path"
 
 
 def test_client_timeout_stays_within_the_core_prefetch_budget():

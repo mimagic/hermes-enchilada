@@ -128,12 +128,29 @@ class EnchiladaClient:
         return result if isinstance(result, str) else ""
 
     def insert_text(self, text: str, title: str = "",
-                    *, timeout: Optional[float] = None) -> Dict[str, Any]:
+                    *, review_status: str = "", metadata: Optional[Dict[str, Any]] = None,
+                    timeout: Optional[float] = None) -> Dict[str, Any]:
+        """``review_status="unreviewed"`` flags a document the user never approved,
+        so autonomously-learned material stays auditable and prunable in the portal."""
         payload: Dict[str, Any] = {"text": text}
         if title:
             payload["title"] = title
+        if review_status:
+            payload["review_status"] = review_status
+        if metadata:
+            payload["metadata"] = metadata
         result = self._request("POST", "/documents/text", payload, timeout=timeout)
         return result if isinstance(result, dict) else {}
+
+    def delete_document(self, document_id: str,
+                        *, timeout: Optional[float] = None) -> bool:
+        """Irreversible. Used only to undo autonomously-learned facts the user rejects."""
+        try:
+            self._request("DELETE", f"/documents/{document_id}", timeout=timeout)
+            return True
+        except EnchiladaError as exc:
+            logger.debug("Deleting document %s failed: %s", document_id, exc)
+            return False
 
     def ping(self) -> bool:
         """Cheap reachability + auth probe that does not need an LLM key."""
