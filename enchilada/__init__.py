@@ -369,6 +369,32 @@ class EnchiladaMemoryProvider(MemoryProvider):
             stored.append(fact["title"])
         return stored
 
+    def _learned_document_ids(self) -> List[str]:
+        """Documents this provider wrote autonomously, session-local list FIRST and the
+        server's ``unreviewed`` set as the durable fallback.
+
+        ``_learned_ids`` is cleared on every session switch, so relying on it alone made
+        the undo a lie the moment a user opened a new session: facts reflection wrote
+        yesterday were unreachable. ``review_status`` is the server-side record of the
+        same thing, which is exactly why autonomous writes carry it.
+        """
+        ids: List[str] = list(self._learned_ids)
+        if not self._client:
+            return ids
+        seen = set(ids)
+        try:
+            for document in self._client.documents(review_status="unreviewed"):
+                if not isinstance(document, dict):
+                    continue
+                document_id = str(document.get("rag_doc_id") or document.get("id") or "")
+                if document_id and document_id not in seen:
+                    seen.add(document_id)
+                    ids.append(document_id)
+        except EnchiladaError as exc:
+            # The session-local ids still get deleted; a partial undo beats none.
+            logger.debug("Listing unreviewed documents failed: %s", exc)
+        return ids
+
     def decline_reflection(self) -> None:
         """Stop learning for this session (the user said no)."""
         self._declined = True
@@ -423,9 +449,11 @@ class EnchiladaMemoryProvider(MemoryProvider):
             },
             {
                 "name": "enchilada_forget_learned",
-                "description": ("Delete the facts this session learned autonomously and "
-                                "stop learning for the rest of it. Call when the user "
-                                "objects to something reflection stored."),
+                "description": ("Delete facts reflection stored autonomously (this "
+                                "session and earlier ones) and stop learning for the "
+                                "rest of this session. Call when the user objects to "
+                                "something reflection stored. Curated documents the "
+                                "user asked for are never touched."),
                 "parameters": {"type": "object", "properties": {}},
             },
         ]
@@ -450,7 +478,7 @@ class EnchiladaMemoryProvider(MemoryProvider):
                 return json.dumps({"stored": True, "document": result},
                                   ensure_ascii=False, default=str)[:4000]
             if tool_name == "enchilada_forget_learned":
-                removed = [doc_id for doc_id in list(self._learned_ids)
+                removed = [doc_id for doc_id in self._learned_document_ids()
                            if self._client.delete_document(doc_id)]
                 self._learned_ids.clear()
                 self.decline_reflection()

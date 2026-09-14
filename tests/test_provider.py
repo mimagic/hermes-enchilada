@@ -49,13 +49,16 @@ EnchiladaError = plugin.EnchiladaError
 class FakeClient:
     """Stands in for EnchiladaClient; records calls, fakes hits and failures."""
 
-    def __init__(self, hits=None, fail=None, delay=0.0):
+    def __init__(self, hits=None, fail=None, delay=0.0, documents=None):
         self.hits = hits if hits is not None else []
         self.fail = fail
         self.delay = delay
         self.searches = []
         self.inserts = []
         self.deletes = []
+        # Server-side documents, as /documents would return them.
+        self.server_documents = list(documents or [])
+        self.document_queries = []
 
     def search(self, query, top_k=5, timeout=None):
         self.searches.append(query)
@@ -78,7 +81,18 @@ class FakeClient:
 
     def delete_document(self, document_id, timeout=None):
         self.deletes.append(document_id)
+        self.server_documents = [d for d in self.server_documents
+                                 if d.get("rag_doc_id") != document_id]
         return True
+
+    def documents(self, limit=100, review_status="", timeout=None):
+        self.document_queries.append(review_status)
+        if self.fail:
+            raise self.fail
+        if review_status:
+            return [d for d in self.server_documents
+                    if d.get("review_status") == review_status][:limit]
+        return self.server_documents[:limit]
 
 
 HIT = {"title": "doc one", "snippet": "the user is marsch"}
@@ -467,6 +481,52 @@ def test_auto_mode_tags_provenance(learning):
     _drive_turns(learning, 2)
     # metadata rides the same call; assert via the client contract
     assert learning._learned_ids, "stored document ids must be tracked for undo"
+
+
+def test_forget_learned_reaches_past_sessions(learning):
+    """The bug this pins: _learned_ids is cleared on every session switch, so an
+    undo that trusts it alone silently spares yesterday's autonomous writes. The
+    server's unreviewed set is the durable record."""
+    import json
+
+    learning._client = FakeClient(hits=[], documents=[
+        {"rag_doc_id": "yesterday_auto", "review_status": "unreviewed"},
+        {"rag_doc_id": "curated_by_user", "review_status": "reviewed"},
+    ])
+    learning.on_session_switch("s2", parent_session_id="s1")
+    assert learning._learned_ids == [], "session switch clears the in-memory list"
+
+    result = json.loads(learning.handle_tool_call("enchilada_forget_learned", {}))
+    assert "yesterday_auto" in learning._client.deletes
+    assert result["removed"] == 1
+
+
+def test_forget_learned_never_deletes_curated_documents(learning):
+    """Documents the user explicitly asked to store are reviewed and must survive
+    an undo — otherwise 'forget what you learned' eats curated knowledge."""
+    import json
+
+    learning._client = FakeClient(hits=[], documents=[
+        {"rag_doc_id": "auto_fact", "review_status": "unreviewed"},
+        {"rag_doc_id": "user_asked_for_this", "review_status": "reviewed"},
+    ])
+    json.loads(learning.handle_tool_call("enchilada_forget_learned", {}))
+    assert learning._client.deletes == ["auto_fact"]
+    assert learning._client.document_queries == ["unreviewed"], \
+        "filtering happens server-side, not by fetching everything"
+
+
+def test_forget_learned_survives_a_listing_failure(learning):
+    """A dead listing endpoint must still delete what this session tracked."""
+    import json
+
+    _drive_turns(learning, 2)
+    tracked = list(learning._learned_ids)
+    assert tracked
+    learning._client.fail = EnchiladaError("listing down")
+
+    result = json.loads(learning.handle_tool_call("enchilada_forget_learned", {}))
+    assert result["removed"] == len(tracked), "partial undo beats no undo"
 
 
 def test_forget_learned_deletes_and_stops_learning(learning):

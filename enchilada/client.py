@@ -104,6 +104,17 @@ class EnchiladaClient:
         result = self._request("GET", f"/documents/recent?limit={int(limit)}")
         return (result or {}).get("documents", []) if isinstance(result, dict) else []
 
+    def documents(self, *, limit: int = 100, review_status: str = "",
+                  timeout: Optional[float] = None) -> List[Dict[str, Any]]:
+        """``/documents`` (not ``/documents/recent``) — carries ``review_status`` and
+        ``rag_synced_at``. ``review_status="unreviewed"`` is server-side filtered, which
+        is what lets an undo find autonomously-written documents from PAST sessions."""
+        path = f"/documents?limit={int(limit)}"
+        if review_status:
+            path += f"&review_status={review_status}"
+        result = self._request("GET", path, timeout=timeout)
+        return (result or {}).get("documents", []) if isinstance(result, dict) else []
+
     def search(self, query: str, top_k: int = 5,
                *, timeout: Optional[float] = None) -> List[Dict[str, Any]]:
         result = self._request("POST", "/documents/search",
