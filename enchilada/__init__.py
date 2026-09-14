@@ -7,18 +7,26 @@ This provider wires it into Hermes as a memory backend:
 * **Recall** — before each turn, a background thread searches the knowledge base
   with the user's message; results are injected into the *user* message by the
   memory manager (never the system prompt, to keep prompt caching intact).
-* **Writes are explicit.** Turns are NOT auto-ingested. Enchilada is a curated
-  knowledge base, not a chat log: every document costs LLM extraction work and
-  pollutes the graph if it is conversational noise. The model writes only when
-  the user asks, via ``enchilada_remember``.
+* **Writes are explicit by default.** Turns are NOT auto-ingested. Enchilada is a
+  curated knowledge base, not a chat log: every document costs LLM extraction
+  work and pollutes the graph if it is conversational noise. The model writes
+  when the user asks, via ``enchilada_remember``.
+* **Reflection (opt-in)** — with ``ENCHILADA_REFLECT`` set, the provider
+  periodically distils *durable facts* from the conversation with an auxiliary
+  model and **proposes** them: the suggestion rides the next turn's memory block
+  as a question. Nothing is written until the user agrees and the model calls
+  ``enchilada_remember``. This is the Honcho-style "learn from talking"
+  behaviour, minus both the transcript dumping and the silent writes.
 
 Config (env, all optional except the key):
   ENCHILADA_API_KEY    required, ``ench_*``
   ENCHILADA_URL        default https://getenchilada.com
   ENCHILADA_WORKSPACE  workspace UUID (omit for the account default)
-  ENCHILADA_TIMEOUT    per-call seconds, default 10
+  ENCHILADA_TIMEOUT    per-call seconds, default 8 (must stay <= the core's 8s cap)
   ENCHILADA_TOP_K      recall hits per turn, default 5
   ENCHILADA_RECALL     ``off`` disables automatic recall (tools still work)
+  ENCHILADA_REFLECT    ``on`` enables fact proposals (default off)
+  ENCHILADA_REFLECT_EVERY  turns between reflection passes, default 6
 """
 
 from __future__ import annotations
@@ -54,6 +62,15 @@ _NOTE_NO_LLM_KEY = ("Knowledge base cannot answer: the instance has no LLM key "
 _NOTE_MORE = ("More matches exist beyond those shown — use enchilada_search with a "
               "higher top_k, or enchilada_ask for a graph-reasoned synthesis.")
 
+# Reflection proposes; the user disposes. The wording has to make the model ASK
+# rather than store, because the tool to store is sitting right there.
+_PROPOSAL_HEADER = (
+    "REFLECTION — these look like durable facts from this conversation. They are "
+    "NOT stored. Ask the user, in your own words and only if it fits the moment, "
+    "whether to keep them; call enchilada_remember ONLY after they agree. If they "
+    "decline or ignore it, drop the subject and do not ask again."
+)
+
 
 def _truthy(value: Optional[str], default: bool = True) -> bool:
     if value is None or value == "":
@@ -78,6 +95,14 @@ class EnchiladaMemoryProvider(MemoryProvider):
         self._llm_key_warned = False
         self._recall_enabled = True
         self._top_k = 5
+        # Reflection state: proposals wait here until a turn picks them up.
+        self._reflect_enabled = False
+        self._reflect_every = 6
+        self._reflect_turn = 0
+        self._reflect_running = False
+        self._proposal: str = ""
+        self._proposed_titles: set = set()   # never propose the same fact twice
+        self._declined = False               # one refusal silences reflection for the session
 
     # -- availability ------------------------------------------------------
 
@@ -99,6 +124,11 @@ class EnchiladaMemoryProvider(MemoryProvider):
         except ValueError:
             self._top_k = 5
         self._recall_enabled = _truthy(os.environ.get("ENCHILADA_RECALL"), True)
+        self._reflect_enabled = _truthy(os.environ.get("ENCHILADA_REFLECT"), False)
+        try:
+            self._reflect_every = max(2, int(os.environ.get("ENCHILADA_REFLECT_EVERY", "") or 6))
+        except ValueError:
+            self._reflect_every = 6
 
         self._client = EnchiladaClient(
             api_key=os.environ.get("ENCHILADA_API_KEY", "").strip(),
@@ -196,16 +226,21 @@ class EnchiladaMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         session_id = session_id or self._session_id
+        # A pending proposal is delivered even when recall is off or the prompt is
+        # trivial — "ok" is exactly when the user has room to answer a question.
+        with self._lock:
+            proposal, self._proposal = self._proposal, ""
+
         if not (self._recall_enabled and self._client):
             self._last_status = None
-            return ""
+            return self._wrap_proposal(proposal)
         # A trivial prompt gets no context AND drops anything buffered: reusing
         # another query's hits on "thanks" is worse than injecting nothing.
         if is_trivial_prompt(query):
             with self._lock:
                 self._pending.pop(session_id, None)
             self._last_status = None
-            return ""
+            return self._wrap_proposal(proposal)
 
         with self._lock:
             entry = self._pending.pop(session_id, None)
@@ -216,17 +251,66 @@ class EnchiladaMemoryProvider(MemoryProvider):
                 entry = self._pending.pop(session_id, None)
         if not entry:
             self._last_status = None
-            return ""
+            return self._wrap_proposal(proposal)
 
         context, count = entry
         # count 0 means "a note, no documents" — the core renders count<=0 generically,
         # so the label carries the distinction instead of claiming a recall happened.
         label = "enchilada" if count else "enchilada (no hits)"
         self._last_status = RecallStatus(provider_label=label, count=count)
+        if proposal:
+            context = context.replace(
+                "</enchilada-memory>", f"\n{proposal}\n</enchilada-memory>")
         return context
+
+    @staticmethod
+    def _wrap_proposal(proposal: str) -> str:
+        return f"<enchilada-memory>\n{proposal}\n</enchilada-memory>" if proposal else ""
 
     def recall_status(self) -> Optional[RecallStatus]:
         return self._last_status
+
+    # -- reflection --------------------------------------------------------
+
+    def sync_turn(self, user_content: str, assistant_content: str, *,
+                  session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None,
+                  turn_author: Optional[Dict[str, Any]] = None) -> None:
+        """Nothing is written here — a completed turn only advances the reflection
+        clock. Runs on the manager's background worker, so the LLM pass is free to
+        take its time."""
+        if not (self._reflect_enabled and self._client) or self._declined:
+            return
+        self._reflect_turn += 1
+        if self._reflect_turn % self._reflect_every:
+            return
+        with self._lock:
+            if self._reflect_running or self._proposal:
+                return  # one pass at a time; don't stack proposals
+            self._reflect_running = True
+        try:
+            self._reflect(list(messages or []))
+        finally:
+            with self._lock:
+                self._reflect_running = False
+
+    def _reflect(self, messages: List[Dict[str, Any]]) -> None:
+        from .reflect import reflect
+
+        facts = reflect(messages)
+        fresh = [f for f in facts if f["title"].lower() not in self._proposed_titles]
+        if not fresh:
+            return
+        for fact in fresh:
+            self._proposed_titles.add(fact["title"].lower())
+        body = "\n".join(f"- {f['title']}: {f['text']}" for f in fresh)
+        with self._lock:
+            self._proposal = f"{_PROPOSAL_HEADER}\n\n{body}"
+
+    def decline_reflection(self) -> None:
+        """Stop proposing for this session (the user said no)."""
+        self._declined = True
+        with self._lock:
+            self._proposal = ""
 
     # -- tools -------------------------------------------------------------
 
@@ -310,13 +394,21 @@ class EnchiladaMemoryProvider(MemoryProvider):
         with self._lock:
             self._pending.pop(self._session_id, None)
             self._inflight = None
+            self._proposal = ""
         self._session_id = new_session_id or ""
         self._last_status = None
+        if reset:
+            # A genuinely new conversation: an old refusal and old proposals no
+            # longer apply, and the reflection clock starts over.
+            self._declined = False
+            self._proposed_titles.clear()
+            self._reflect_turn = 0
 
     def shutdown(self) -> None:
         with self._lock:
             self._pending.clear()
             self._inflight = None
+            self._proposal = ""
 
     # -- setup -------------------------------------------------------------
 
@@ -334,4 +426,10 @@ class EnchiladaMemoryProvider(MemoryProvider):
              "env_var": "ENCHILADA_TOP_K"},
             {"key": "recall", "description": "Automatic recall before each turn",
              "type": "boolean", "default": True, "env_var": "ENCHILADA_RECALL"},
+            {"key": "reflect", "description":
+             "Propose durable facts from conversations (asks before storing)",
+             "type": "boolean", "default": False, "env_var": "ENCHILADA_REFLECT"},
+            {"key": "reflect_every", "description": "Turns between reflection passes",
+             "type": "integer", "default": 6, "minimum": 2, "maximum": 50,
+             "env_var": "ENCHILADA_REFLECT_EVERY"},
         ]

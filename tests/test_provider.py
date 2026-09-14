@@ -301,6 +301,129 @@ def test_config_schema_marks_key_secret(provider):
     assert fields["api_key"]["env_var"] == "ENCHILADA_API_KEY"
 
 
+def test_reflection_defaults_to_off(provider):
+    """Writing to someone's knowledge base uninvited is a surprise."""
+    assert provider._reflect_enabled is False
+
+
+# -- reflection -----------------------------------------------------------
+
+FACTS = [{"title": "deploy flow", "text": "Deploys go through staging first."}]
+
+
+@pytest.fixture
+def reflecting(monkeypatch):
+    monkeypatch.setenv("ENCHILADA_API_KEY", "ench_test")
+    monkeypatch.setenv("ENCHILADA_REFLECT", "on")
+    monkeypatch.setenv("ENCHILADA_REFLECT_EVERY", "2")
+    p = EnchiladaMemoryProvider()
+    p.initialize("s1", hermes_home="/tmp", platform="cli")
+    p._client = FakeClient(hits=[])
+    return p
+
+
+def _drive_turns(provider, count, facts=FACTS):
+    import enchilada_plugin.reflect as reflect_mod
+    original = reflect_mod.reflect
+    reflect_mod.reflect = lambda messages, **kw: list(facts)
+    try:
+        for _ in range(count):
+            provider.sync_turn("u", "a", session_id="s1", messages=[{"role": "user", "content": "x"}])
+    finally:
+        reflect_mod.reflect = original
+
+
+def test_reflection_proposes_but_never_stores(reflecting):
+    """The whole point: a fact is offered, not written."""
+    fake = FakeClient(hits=[])
+    reflecting._client = fake
+    _drive_turns(reflecting, 2)
+    context = reflecting.prefetch("what now?", session_id="s1")
+    assert "REFLECTION" in context
+    assert "Deploys go through staging first" in context
+    assert fake.inserts == [], "reflection must not write on its own"
+
+
+def test_proposal_instructs_the_model_to_ask(reflecting):
+    _drive_turns(reflecting, 2)
+    context = reflecting.prefetch("what now?", session_id="s1")
+    assert "NOT stored" in context
+    assert "enchilada_remember ONLY after they agree" in context
+
+
+def test_proposal_is_delivered_even_on_a_trivial_prompt(reflecting):
+    """'ok' is exactly when the user has room to answer a question."""
+    _drive_turns(reflecting, 2)
+    context = reflecting.prefetch("ok", session_id="s1")
+    assert "REFLECTION" in context
+
+
+def test_proposal_is_delivered_once(reflecting):
+    _drive_turns(reflecting, 2)
+    assert "REFLECTION" in reflecting.prefetch("q", session_id="s1")
+    assert "REFLECTION" not in reflecting.prefetch("q", session_id="s1")
+
+
+def test_same_fact_is_never_proposed_twice(reflecting):
+    _drive_turns(reflecting, 2)
+    reflecting.prefetch("q", session_id="s1")      # consume
+    _drive_turns(reflecting, 2)                     # same fact again
+    assert reflecting._proposal == ""
+
+
+def test_declining_silences_reflection_for_the_session(reflecting):
+    reflecting.decline_reflection()
+    _drive_turns(reflecting, 4)
+    assert reflecting._proposal == ""
+    assert "REFLECTION" not in reflecting.prefetch("q", session_id="s1")
+
+
+def test_reflection_respects_its_cadence(reflecting):
+    _drive_turns(reflecting, 1)          # cadence is 2
+    assert reflecting._proposal == ""
+    _drive_turns(reflecting, 1)
+    assert "REFLECTION" in reflecting._proposal
+
+
+def test_reflection_is_skipped_when_disabled(provider):
+    _drive_turns(provider, 10)
+    assert provider._proposal == ""
+
+
+def test_reset_clears_refusal_and_history(reflecting):
+    reflecting.decline_reflection()
+    reflecting.on_session_switch("s2", reset=True)
+    assert reflecting._declined is False
+    assert reflecting._proposed_titles == set()
+
+
+def test_empty_reflection_proposes_nothing(reflecting):
+    _drive_turns(reflecting, 2, facts=[])
+    assert reflecting._proposal == ""
+    assert reflecting.prefetch("q", session_id="s1") == ""
+
+
+def test_reflect_parses_fenced_json():
+    from enchilada_plugin.reflect import _parse_facts
+
+    facts = _parse_facts('```json\n{"facts": [{"title": "t", "text": "body"}]}\n```')
+    assert facts == [{"title": "t", "text": "body"}]
+
+
+def test_reflect_tolerates_garbage():
+    from enchilada_plugin.reflect import _parse_facts
+
+    assert _parse_facts("I could not find any durable facts.") == []
+    assert _parse_facts("") == []
+
+
+def test_reflect_drops_factless_entries():
+    from enchilada_plugin.reflect import _parse_facts
+
+    facts = _parse_facts('{"facts": [{"title": "t"}, {"text": "keeps"}]}')
+    assert len(facts) == 1 and facts[0]["text"] == "keeps"
+
+
 def test_client_timeout_stays_within_the_core_prefetch_budget():
     """Hermes aborts an external prefetch at _EXTERNAL_PREFETCH_TIMEOUT_S and then
     skips the provider until the stuck call returns. A client timeout above that

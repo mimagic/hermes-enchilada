@@ -29,6 +29,8 @@ Secrets belong in `~/.hermes/.env` (chmod 600), never in `config.yaml`:
 | `ENCHILADA_TIMEOUT` | no | `8` | Per-call seconds |
 | `ENCHILADA_TOP_K` | no | `5` | Documents recalled per turn |
 | `ENCHILADA_RECALL` | no | `on` | `off` disables automatic recall (tools stay) |
+| `ENCHILADA_REFLECT` | no | `off` | `on` proposes durable facts from conversations |
+| `ENCHILADA_REFLECT_EVERY` | no | `6` | Turns between reflection passes |
 
 **The workspace header wants the UUID, not the `ragWorkspace` slug.** Passing the
 slug (`ws_…`) returns `403 Workspace not found or not accessible`. List them with:
@@ -75,8 +77,36 @@ never part of automatic recall.
 
 **Writes are explicit.** Turns are not auto-ingested. Enchilada is a curated
 knowledge base, not a chat log: every document costs LLM extraction and pollutes
-the graph with conversational noise. The model writes only via
-`enchilada_remember`, when the user asks.
+the graph with conversational noise. The model writes via `enchilada_remember`,
+when the user asks.
+
+### Reflection — learning from conversations (opt-in, off by default)
+
+`ENCHILADA_REFLECT=on` makes the provider *notice* durable facts instead of
+waiting to be told. Every `ENCHILADA_REFLECT_EVERY` turns (default 6), an
+auxiliary-model pass reads the conversation and extracts only what stays true
+afterwards — preferences, decisions and their reasons, domain facts, corrections.
+
+**It proposes; it never stores.** The result rides the next memory block as a
+request to ask the user, and nothing is written until they agree and the model
+calls `enchilada_remember`. A refusal silences reflection for the session; the
+same fact is never proposed twice; a genuinely new conversation resets both.
+
+What it keeps versus drops, from a real run:
+
+| Said in the conversation | Kept? |
+| :--- | :--- |
+| "deploys always go through staging first" | ✅ durable convention |
+| "we use Postgres, not Mongo, because of the joins" | ✅ decision + reason |
+| "I work in German, don't write English" | ✅ standing preference |
+| "the tests came back green" | ❌ session event |
+
+Most conversations yield nothing, which is the designed outcome — the prompt says
+so explicitly so the model does not invent facts to fill a quota.
+
+This is the Honcho-shaped behaviour (derive a model of the user over time) built
+from Enchilada's document primitives, minus the transcript dumping and minus
+silent writes.
 
 ## Tools
 
@@ -133,6 +163,7 @@ The suite runs offline against a fake client — no API key, no network.
 ```
 enchilada/        the plugin itself (copy to $HERMES_HOME/plugins/enchilada/)
   __init__.py     EnchiladaMemoryProvider
+  reflect.py      auxiliary-model fact extraction
   client.py       stdlib-only REST client
   plugin.yaml     manifest
 tests/            offline behaviour tests
