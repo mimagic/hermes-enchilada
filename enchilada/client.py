@@ -22,13 +22,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_URL = "https://getenchilada.com"
 
+# Hermes bounds an external provider's prefetch at 8s (_EXTERNAL_PREFETCH_TIMEOUT_S)
+# and then skips the provider until the stuck call returns. Staying at or below that
+# keeps the client's own timeout the one that fires, so we can still report back.
+DEFAULT_TIMEOUT = 8.0
+
 
 class EnchiladaError(RuntimeError):
     """An API call failed. ``status`` is the HTTP code when there was one."""
 
-    def __init__(self, message: str, status: Optional[int] = None):
+    def __init__(self, message: str, status: Optional[int] = None,
+                 *, timed_out: bool = False):
         super().__init__(message)
         self.status = status
+        self.timed_out = timed_out
 
     @property
     def needs_llm_key(self) -> bool:
@@ -39,7 +46,7 @@ class EnchiladaError(RuntimeError):
 
 class EnchiladaClient:
     def __init__(self, api_key: str, base_url: str = DEFAULT_URL,
-                 workspace: str = "", timeout: float = 10.0):
+                 workspace: str = "", timeout: float = DEFAULT_TIMEOUT):
         self.api_key = api_key
         self.base_url = (base_url or DEFAULT_URL).rstrip("/")
         self.workspace = workspace or ""
@@ -70,7 +77,14 @@ class EnchiladaClient:
                 pass
             raise EnchiladaError(detail or exc.reason, status=exc.code) from None
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
-            raise EnchiladaError(f"unreachable: {exc}") from None
+            # socket.timeout is a TimeoutError subclass; URLError wraps it too.
+            reason = getattr(exc, "reason", exc)
+            timed_out = isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError)
+            raise EnchiladaError(
+                f"timed out after {timeout or self.timeout:g}s" if timed_out
+                else f"unreachable: {exc}",
+                timed_out=timed_out,
+            ) from None
 
         if not body:
             return None
@@ -102,7 +116,8 @@ class EnchiladaClient:
         return result if isinstance(result, list) else []
 
     def query(self, question: str, *, timeout: Optional[float] = None) -> str:
-        """Graph-reasoned answer. Slower than search — give it a longer timeout."""
+        """Graph-reasoned answer. Measured ~3-4s on a cold query versus ~0.3s for
+        search, so it gets its own budget and is never used for automatic recall."""
         result = self._request("POST", "/query", {"query": question},
                                timeout=timeout or max(self.timeout, 30.0))
         if isinstance(result, dict):

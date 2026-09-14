@@ -181,15 +181,45 @@ def test_top_k_is_honoured(monkeypatch):
 # -- fail-open ------------------------------------------------------------
 
 def test_recall_fails_open_on_error(provider):
+    """Unreachable: no documents, but the model is TOLD memory was consulted."""
     provider._client = FakeClient(fail=EnchiladaError("unreachable"))
-    assert provider.prefetch("who is marsch?", session_id="s1") == ""
-    assert provider.recall_status() is None
+    context = provider.prefetch("who is marsch?", session_id="s1")
+    assert "NOTE:" in context and "unreachable" in context.lower()
+    assert provider.recall_status().count == 0
+
+
+def test_recall_reports_timeout_as_possibly_incomplete(provider):
+    """A timeout must never read as 'the knowledge base is empty'."""
+    provider._client = FakeClient(
+        fail=EnchiladaError("timed out after 8s", timed_out=True))
+    context = provider.prefetch("who is marsch?", session_id="s1")
+    assert "NOTE:" in context
+    assert "in time" in context
+    assert "enchilada_search" in context, "must offer a retry path"
 
 
 def test_recall_fails_open_on_missing_llm_key(provider):
     provider._client = FakeClient(
         fail=EnchiladaError("LLM API key not configured. Visit /app/settings", status=400))
-    assert provider.prefetch("who is marsch?", session_id="s1") == ""
+    context = provider.prefetch("who is marsch?", session_id="s1")
+    assert "NOTE:" in context and "LLM key" in context
+
+
+def test_full_page_of_hits_signals_more_exist(monkeypatch):
+    """The API returns no total, so a full page is the 'there is more' signal."""
+    monkeypatch.setenv("ENCHILADA_API_KEY", "ench_test")
+    monkeypatch.setenv("ENCHILADA_TOP_K", "2")
+    p = EnchiladaMemoryProvider()
+    p.initialize("s1", hermes_home="/tmp", platform="cli")
+    p._client = FakeClient(hits=[HIT, HIT2, HIT])
+    context = p.prefetch("query", session_id="s1")
+    assert "More matches exist" in context
+
+
+def test_partial_page_does_not_claim_more(provider):
+    provider._client = FakeClient(hits=[HIT])
+    context = provider.prefetch("query", session_id="s1")
+    assert "More matches exist" not in context
 
 
 def test_unexpected_exception_does_not_escape(provider):
@@ -269,3 +299,20 @@ def test_config_schema_marks_key_secret(provider):
     fields = {f["key"]: f for f in provider.get_config_schema()}
     assert fields["api_key"]["secret"] is True
     assert fields["api_key"]["env_var"] == "ENCHILADA_API_KEY"
+
+
+def test_client_timeout_stays_within_the_core_prefetch_budget():
+    """Hermes aborts an external prefetch at _EXTERNAL_PREFETCH_TIMEOUT_S and then
+    skips the provider until the stuck call returns. A client timeout above that
+    never fires, so the provider can no longer report why it went quiet."""
+    from agent.memory_manager import _EXTERNAL_PREFETCH_TIMEOUT_S
+
+    assert plugin.DEFAULT_TIMEOUT <= _EXTERNAL_PREFETCH_TIMEOUT_S
+
+
+def test_default_timeout_is_used_when_env_is_unset(monkeypatch):
+    monkeypatch.setenv("ENCHILADA_API_KEY", "ench_test")
+    monkeypatch.delenv("ENCHILADA_TIMEOUT", raising=False)
+    p = EnchiladaMemoryProvider()
+    p.initialize("s1", hermes_home="/tmp", platform="cli")
+    assert p._client.timeout == plugin.DEFAULT_TIMEOUT

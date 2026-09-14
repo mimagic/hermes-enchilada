@@ -36,12 +36,23 @@ from agent.memory_provider import (
     spawn_context_thread,
 )
 
-from .client import DEFAULT_URL, EnchiladaClient, EnchiladaError
+from .client import DEFAULT_TIMEOUT, DEFAULT_URL, EnchiladaClient, EnchiladaError
 
 logger = logging.getLogger(__name__)
 
 _MAX_SNIPPET = 600
 _MAX_CONTEXT = 4000
+
+# Recall always reports back, even when it found nothing usable, so the model can
+# tell "the knowledge base was consulted and is quiet" from "memory never ran".
+_NOTE_TIMEOUT = ("Knowledge base did not answer in time — it may hold relevant "
+                 "material that is missing here. Retry with enchilada_search if it matters.")
+_NOTE_UNREACHABLE = ("Knowledge base unreachable — treat this as no information, "
+                     "not as an empty knowledge base.")
+_NOTE_NO_LLM_KEY = ("Knowledge base cannot answer: the instance has no LLM key "
+                    "configured (/app/settings).")
+_NOTE_MORE = ("More matches exist beyond those shown — use enchilada_search with a "
+              "higher top_k, or enchilada_ask for a graph-reasoned synthesis.")
 
 
 def _truthy(value: Optional[str], default: bool = True) -> bool:
@@ -80,9 +91,9 @@ class EnchiladaMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id or ""
         try:
-            timeout = float(os.environ.get("ENCHILADA_TIMEOUT", "") or 10.0)
+            timeout = float(os.environ.get("ENCHILADA_TIMEOUT", "") or DEFAULT_TIMEOUT)
         except ValueError:
-            timeout = 10.0
+            timeout = DEFAULT_TIMEOUT
         try:
             self._top_k = max(1, int(os.environ.get("ENCHILADA_TOP_K", "") or 5))
         except ValueError:
@@ -111,7 +122,7 @@ class EnchiladaMemoryProvider(MemoryProvider):
 
     # -- recall ------------------------------------------------------------
 
-    def _format_hits(self, hits: List[Dict[str, Any]]) -> str:
+    def _format_hits(self, hits: List[Dict[str, Any]], *, note: str = "") -> str:
         lines: List[str] = []
         for index, hit in enumerate(hits, 1):
             if not isinstance(hit, dict):
@@ -127,31 +138,44 @@ class EnchiladaMemoryProvider(MemoryProvider):
             if len(body) > _MAX_SNIPPET:
                 body = body[:_MAX_SNIPPET].rsplit(" ", 1)[0] + "…"
             lines.append(f"[{index}] {title}\n{body}" if body else f"[{index}] {title}")
-        if not lines:
-            return ""
+
         block = "\n\n".join(lines)
         if len(block) > _MAX_CONTEXT:
             block = block[:_MAX_CONTEXT].rsplit("\n\n", 1)[0] + "\n\n…(truncated)"
-        return f"<enchilada-memory>\n{block}\n</enchilada-memory>"
+            note = note or _NOTE_MORE
+        if not block and not note:
+            return ""
+        parts = [part for part in (block, f"NOTE: {note}" if note else "") if part]
+        return "<enchilada-memory>\n" + "\n\n".join(parts) + "\n</enchilada-memory>"
 
     def _fetch(self, query: str, session_id: str) -> None:
+        """Always records an outcome: hits, or a note explaining the silence."""
         try:
             hits = self._client.search(query, top_k=self._top_k) if self._client else []
-            context = self._format_hits(hits)
             count = sum(1 for hit in hits if isinstance(hit, dict))
+            # No total in the API response, so a full page is the only "more exists"
+            # signal available. Upstream could expose a real total later.
+            note = _NOTE_MORE if count >= self._top_k else ""
+            context = self._format_hits(hits, note=note)
             with self._lock:
                 if context:
                     self._pending[session_id] = (context, count)
                 self._inflight = None
         except EnchiladaError as exc:
-            # Fail open: recall never blocks or breaks a turn.
-            if exc.needs_llm_key and not self._llm_key_warned:
-                self._llm_key_warned = True
-                logger.warning("Enchilada recall unavailable: no LLM key configured "
-                               "on the instance (add one at /app/settings).")
+            if exc.needs_llm_key:
+                note = _NOTE_NO_LLM_KEY
+                if not self._llm_key_warned:
+                    self._llm_key_warned = True
+                    logger.warning("Enchilada recall unavailable: no LLM key configured "
+                                   "on the instance (add one at /app/settings).")
+            elif exc.timed_out:
+                note = _NOTE_TIMEOUT
+                logger.warning("Enchilada recall timed out: %s", exc)
             else:
+                note = _NOTE_UNREACHABLE
                 logger.debug("Enchilada recall failed: %s", exc)
             with self._lock:
+                self._pending[session_id] = (self._format_hits([], note=note), 0)
                 self._inflight = None
         except Exception as exc:  # noqa: BLE001 - a recall bug must not kill the turn
             logger.debug("Enchilada recall error: %s", exc)
@@ -195,7 +219,10 @@ class EnchiladaMemoryProvider(MemoryProvider):
             return ""
 
         context, count = entry
-        self._last_status = RecallStatus(provider_label="enchilada", count=count)
+        # count 0 means "a note, no documents" — the core renders count<=0 generically,
+        # so the label carries the distinction instead of claiming a recall happened.
+        label = "enchilada" if count else "enchilada (no hits)"
+        self._last_status = RecallStatus(provider_label=label, count=count)
         return context
 
     def recall_status(self) -> Optional[RecallStatus]:

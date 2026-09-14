@@ -26,7 +26,7 @@ Secrets belong in `~/.hermes/.env` (chmod 600), never in `config.yaml`:
 | `ENCHILADA_API_KEY` | yes | — | Bearer key (`ench_*`) |
 | `ENCHILADA_URL` | no | `https://getenchilada.com` | Instance base URL |
 | `ENCHILADA_WORKSPACE` | no | account default | Workspace **UUID** |
-| `ENCHILADA_TIMEOUT` | no | `10` | Per-call seconds |
+| `ENCHILADA_TIMEOUT` | no | `8` | Per-call seconds |
 | `ENCHILADA_TOP_K` | no | `5` | Documents recalled per turn |
 | `ENCHILADA_RECALL` | no | `on` | `off` disables automatic recall (tools stay) |
 
@@ -46,9 +46,32 @@ background thread; hits are injected into the *user* message as an
 caching. Trivial prompts ("ok", "thanks", slash commands) are skipped and drop any
 buffered context, so a leftover lookup never lands on an unrelated reply.
 
-**Reads fail open.** A slow, unreachable or unauthenticated instance yields no
-context and never blocks a turn. Absence of a memory block therefore does *not*
-mean "nothing is known".
+**Reads fail open — but never silently.** A slow, unreachable or unauthenticated
+instance yields no documents, yet recall still returns a `NOTE:` line saying so.
+The distinction matters: "the knowledge base is quiet" and "the knowledge base
+never answered" must not look identical to the model. Notes cover timeout,
+unreachable, and missing-LLM-key.
+
+**"There is more" signalling.** The search endpoint returns no total count, so a
+full page of hits is the only available signal that more matches exist; the
+recall block then says so and points at `enchilada_search` with a higher `top_k`
+or `enchilada_ask`. If the API grows a real `total`, use it instead of this
+heuristic.
+
+### Timeouts
+
+| Path | Budget | Measured |
+| :--- | :--- | :--- |
+| `POST /documents/search` (auto-recall) | `ENCHILADA_TIMEOUT`, default **8 s** | 0.3–1.1 s |
+| `POST /query` (`enchilada_ask`) | `max(timeout, 30 s)` | 3.2–3.7 s cold, ~0.4 s warm |
+
+**The default must stay at or below 8 s.** Hermes bounds an external provider's
+prefetch at `_EXTERNAL_PREFETCH_TIMEOUT_S = 8.0` and then skips that provider
+until the stuck call returns — a higher client timeout would never fire, so the
+provider could not report why it went quiet. A test asserts this relationship.
+
+Graph queries cost roughly 10× a plain search, which is why they are a tool and
+never part of automatic recall.
 
 **Writes are explicit.** Turns are not auto-ingested. Enchilada is a curated
 knowledge base, not a chat log: every document costs LLM extraction and pollutes
