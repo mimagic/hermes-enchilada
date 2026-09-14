@@ -573,3 +573,60 @@ def test_default_timeout_is_used_when_env_is_unset(monkeypatch):
     p = EnchiladaMemoryProvider()
     p.initialize("s1", hermes_home="/tmp", platform="cli")
     assert p._client.timeout == plugin.DEFAULT_TIMEOUT
+
+
+# -- trivial-prompt gate (provider-side widening) -------------------------
+
+def test_plugin_gate_never_contradicts_core():
+    """The contract that makes a provider-side word list safe: core runs FIRST and
+    decides whether the provider is consulted at all, so the plugin may be STRICTER
+    but never looser. Anything core calls trivial must stay trivial here."""
+    from agent.memory_provider import is_trivial_prompt as core_gate
+    from enchilada_plugin.trivial import is_trivial_prompt as plugin_gate
+
+    for text in ("hi", "ok", "thanks :)", "done???", "lgtm", "", "   ", "/help",
+                 "yes.", "k", "go ahead", "got it"):
+        assert core_gate(text) and plugin_gate(text), f"core-trivial must stay trivial: {text!r}"
+
+
+def test_german_acknowledgements_are_trivial():
+    """Core's list is English, so "passt"/"danke" would each cost a search
+    round-trip against the knowledge base for zero signal."""
+    from enchilada_plugin.trivial import is_trivial_prompt
+
+    for text in ("ja", "nein", "passt", "danke", "dankeschön", "alles klar",
+                 "stimmt", "genau", "perfekt", "verstanden.", "nö", "gern",
+                 "klar", "weiter", "mach das", "super :)", "na klar"):
+        assert is_trivial_prompt(text), f"expected trivial: {text!r}"
+
+
+def test_runs_of_acknowledgements_are_trivial():
+    """"ja, passt!" is two acknowledgements joined by punctuation, not a request;
+    a single-token regex misses exactly this shape."""
+    from enchilada_plugin.trivial import is_trivial_prompt
+
+    for text in ("ja, passt!", "alles klar danke", "ja klar!!", "ja, genau. passt!",
+                 "passt, danke"):
+        assert is_trivial_prompt(text), f"expected trivial: {text!r}"
+
+
+def test_german_prefix_collisions_pass_through():
+    """These words commonly OPEN a real request; matching them as a prefix would
+    silently disable recall for ordinary German prompts."""
+    from enchilada_plugin.trivial import is_trivial_prompt
+
+    for text in ("ja beides fixen", "passt das zu meinem Setup?",
+                 "danke, kannst du noch die Logs prüfen",
+                 "weiter mit dem nächsten Repo", "klar strukturierte Doku bitte",
+                 "nein, das ist falsch weil X", "japan", "jackpot", "klarheit",
+                 "genau genommen ist das anders", "top priorität ist jetzt X",
+                 "bitte lies die Datei"):
+        assert not is_trivial_prompt(text), f"expected non-trivial: {text!r}"
+
+
+def test_trivial_german_prompt_spends_no_request(provider):
+    """The point of the widening: an acknowledgement must not reach the network."""
+    provider._client = FakeClient(hits=[HIT])
+    assert provider.prefetch("ja, passt!", session_id="s1") == ""
+    provider.queue_prefetch("danke", session_id="s1")
+    assert provider._client.searches == [], "no search may be issued for an acknowledgement"

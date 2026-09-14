@@ -45,11 +45,11 @@ from typing import Any, Dict, List, Optional
 from agent.memory_provider import (
     MemoryProvider,
     RecallStatus,
-    is_trivial_prompt,
     spawn_context_thread,
 )
 
 from .client import DEFAULT_TIMEOUT, DEFAULT_URL, EnchiladaClient, EnchiladaError
+from .trivial import is_trivial_prompt
 
 logger = logging.getLogger(__name__)
 
